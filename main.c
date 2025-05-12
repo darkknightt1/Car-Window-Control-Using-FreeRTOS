@@ -1,0 +1,424 @@
+/* FreeRTOS includes. */
+#include "FreeRTOS.h" //include freeRtos files 
+//#include "FreeRTOSConfig.h"
+#include "task.h" //File that contains APIs that start with tasks
+#include "tm4c123gh6pm.h"
+#include <string.h>
+#include <stdio.h>
+#include "queue.h"
+#include "semphr.h"
+#include <stdlib.h>
+
+#include "DIO.h"
+#include "interrupts.h"
+#include "bitwise_operation.h"
+#include "UART.h"
+
+
+//convert integer to ASCI , macro function
+#define itoad(number, string, base)                                           \
+    do                                                                        \
+    {                                                                         \
+        sprintf(string, "%d", number);                                        \
+    }                                                                         \
+    while(0)
+#define mainDELAY_LOOP_COUNT		( 0xfffff )
+		
+//Global Var
+uint8_t Jam_Flag =0;
+uint8_t Up_flag =0; //flag that idicate that the motor is currently working Up by driver
+uint8_t Down_flag =0;
+
+uint8_t Up_flag_Pas =0; //flag that idicate that the motor is currently working Up by driver
+uint8_t Down_flag_Pas=0;
+char volatile globalState = 0;
+
+
+//define semaphores
+xSemaphoreHandle DriverUpSemphore;
+xSemaphoreHandle DriverDownSemphore;
+xSemaphoreHandle PassengerUpSemphore;
+xSemaphoreHandle PassengerDownSemphore;
+xSemaphoreHandle obstacle;
+
+//define Task handles
+TaskHandle_t  DriverUpHandle;
+TaskHandle_t  DriverDownHandle;
+TaskHandle_t  PasUpHandle;
+TaskHandle_t  PasDownHandle;
+
+
+//define Queues
+xQueueHandle UartQueue;
+//define tasks
+void DriverUp(void* pvParameters);
+void DriverDown(void* pvParameters);
+void PassengerUp(void* pvParameters);
+void PassengerDown(void* pvParameters);
+void obstaclee(void* pvParameters);
+void UART_TASK(void *pvParameters);
+
+//interrupt handlers
+void GPIOF_Handler(void)
+{
+	
+	if((Get_Bit(GPIO_PORTF_MIS_R,1))==1 && Down_flag_Pas==0 && Down_flag==0) //obstacle
+	{
+		
+		portBASE_TYPE xHigherPriorityTaskWoken5 = pdFALSE;
+		xSemaphoreGiveFromISR(obstacle,&xHigherPriorityTaskWoken5);
+	  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken5);		
+		
+	  
+	}
+	if((Get_Bit(GPIO_PORTF_MIS_R,0))==1) //UpDriver
+	{
+		portBASE_TYPE xHigherPriorityTaskWoken = pdFALSE;
+		xSemaphoreGiveFromISR(DriverUpSemphore,&xHigherPriorityTaskWoken);
+	  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+		
+	}
+	else if((Get_Bit(GPIO_PORTF_MIS_R,4))==1) //DownDriver
+	{
+		portBASE_TYPE xHigherPriorityTaskWoken2 = pdFALSE;
+	 // xSemaphoreGiveFromISR(DriverUpSemphore,&xHigherPriorityTaskWoken);
+		xSemaphoreGiveFromISR(DriverDownSemphore,&xHigherPriorityTaskWoken2);
+	  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken2);
+	}
+	else if((Get_Bit(GPIO_PORTF_MIS_R,2))==1  && Down_flag == 0)//passengerUp
+	{
+		
+	portBASE_TYPE xHigherPriorityTaskWoken3 = pdFALSE;
+	xSemaphoreGiveFromISR(PassengerUpSemphore,&xHigherPriorityTaskWoken3);
+	portEND_SWITCHING_ISR(xHigherPriorityTaskWoken3);
+		
+	} 
+	else if(Get_Bit(GPIO_PORTF_MIS_R,3)==1  && Up_flag == 0) //passengerDown
+	{
+		portBASE_TYPE xHigherPriorityTaskWoken4 = pdFALSE;
+	  xSemaphoreGiveFromISR(PassengerDownSemphore,&xHigherPriorityTaskWoken4);
+	  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken4);
+		
+	}
+	GPIO_PORTF_ICR_R |= 0x1F;
+}
+
+
+int main( void )
+
+{	//Create semaphores
+	vSemaphoreCreateBinary(DriverUpSemphore);
+	vSemaphoreCreateBinary(DriverDownSemphore);
+  vSemaphoreCreateBinary(PassengerUpSemphore);
+  vSemaphoreCreateBinary(PassengerDownSemphore);
+	vSemaphoreCreateBinary(obstacle);
+	
+	 UartQueue = xQueueCreate( 5, sizeof( char ) );
+	
+	//intialize ports
+	DIO_init(INT_GPIOF);   //for push buttons and leds
+	DIO_init(INT_GPIOA);   //for motor and uart
+	DIO_init(INT_GPIOD);	//limit switch
+	DIO_init(INT_GPIOB);	
+	
+	//intialize interrupts
+	INT_PORTF_INIT(PIN0,1);
+	INT_PORTF_INIT(PIN4,1);
+	INT_PORTF_INIT(PIN2,1);
+	INT_PORTF_INIT(PIN3,1);
+	INT_PORTF_INIT(PIN1,0);
+	
+	//intialize uart for state check
+	UART_init();
+	
+	//set up pin directions
+	GPIO_setupPinDirection(INT_GPIOF,PIN1,PIN_INPUT); //Obstacle
+	GPIO_setupPinDirection(INT_GPIOF,PIN0,PIN_INPUT);  //pb updriver
+	GPIO_setupPinDirection(INT_GPIOF,PIN4,PIN_INPUT);  //pb downdriver
+	GPIO_setupPinDirection(INT_GPIOF,PIN2,PIN_INPUT);  //pb passengerup
+	GPIO_setupPinDirection(INT_GPIOF,PIN3,PIN_INPUT);  //pb passengerdown
+	GPIO_setupPinDirection(INT_GPIOA,PIN2,PIN_OUTPUT);  //motor enable
+	GPIO_setupPinDirection(INT_GPIOA,PIN3,PIN_OUTPUT);  //in1 motor
+	GPIO_setupPinDirection(INT_GPIOA,PIN4,PIN_OUTPUT);  //in2 motor
+	GPIO_setupPinDirection(INT_GPIOD,PIN6,PIN_INPUT);  //limitSwitchUp
+	GPIO_setupPinDirection(INT_GPIOD,PIN7,PIN_INPUT);  //limitSwitchDown
+	GPIO_setupPinDirection(INT_GPIOD,PIN2,PIN_INPUT);  //Lock
+	
+	
+		GPIO_setupPinDirection(INT_GPIOB,PIN6,PIN_OUTPUT);  //in1 motor
+	GPIO_setupPinDirection(INT_GPIOB,PIN7,PIN_OUTPUT);  //in2 motor
+	
+  Set_Bit(GPIO_PORTF_PUR_R,2);//pb passengerup
+	Set_Bit(GPIO_PORTF_PUR_R,3);//pb passengerdown
+	Set_Bit(GPIO_PORTF_PUR_R,4);//pb downdriver
+	Set_Bit(GPIO_PORTD_PUR_R,2);
+	Set_Bit(GPIO_PORTF_PUR_R,1);
+	//Set_Bit(GPIO_PORTF_PUR_R,0);
+	
+
+
+	//create tasks
+	xTaskCreate( DriverDown, "DriverDown", 240, NULL, 1, DriverDownHandle );//to down window by driver
+	xTaskCreate( DriverUp, "DriverUp", 240, NULL, 1, DriverUpHandle ); //to elevate window by driver
+  xTaskCreate( PassengerUp, "PassengerUp", 240, NULL, 1, PasUpHandle ); //to elevate window by Passenger
+  xTaskCreate( PassengerDown, "PassengerDown", 240, NULL, 1, PasDownHandle );  //to down window by Passenger
+	xTaskCreate( obstaclee, "obstaclee", 240, NULL, 2, NULL );  //to down window by Passenger
+	xTaskCreate( UART_TASK, "StateCheck", 240, NULL, 1, NULL );	
+
+	
+	//start scheduler
+	 vTaskStartScheduler();	
+	 for( ;; );
+
+}
+void obstaclee(void* pvParameters)
+{
+	xSemaphoreTake(obstacle,0);
+	
+     for(;;)
+     {
+     	  xSemaphoreTake(obstacle,portMAX_DELAY);
+			  Jam_Flag = 1;
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+				DIO_writePin(INT_GPIOA,PIN3,LOGIC_LOW);
+				DIO_writePin(INT_GPIOA,PIN4,LOGIC_HIGH);
+				
+			 vTaskDelay(500);
+			 
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);
+			 
+			 
+		 }
+	 }
+
+void DriverUp(void* pvParameters)
+{
+	  xSemaphoreTake(DriverUpSemphore,0);
+	  portBASE_TYPE xStatus;
+     for(;;)
+     {
+     	  xSemaphoreTake(DriverUpSemphore,portMAX_DELAY);
+			  Up_flag = 1;
+				Down_flag = 0;
+			  
+			  vTaskDelay(250);
+//---------------------automatic mode------------------------------------------------------------
+			 //if not pressed
+			 if((Get_Bit(GPIO_PORTF_DATA_R,0)))
+			 {	
+				globalState = 'A';
+				xStatus = xQueueSendToBack( UartQueue, &globalState, 0 );
+				Up_flag   = 1;
+				Down_flag = 0;
+				DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);//enable
+				DIO_writePin(INT_GPIOA,PIN3,LOGIC_HIGH);
+				DIO_writePin(INT_GPIOA,PIN4,LOGIC_LOW);
+				    DIO_writePin(INT_GPIOB,PIN6,LOGIC_HIGH);
+				    DIO_writePin(INT_GPIOB,PIN7,LOGIC_LOW);
+				
+				while((Get_Bit(GPIO_PORTD_DATA_R,6))==0  && Jam_Flag==0 && Down_flag == 0); // while limit switch is not 2ary , and iam not returning from jam-stop state
+				Jam_Flag = 0;
+				Up_flag  = 0;				  
+			 }
+			 
+			 else
+			 {
+				  globalState = 'B';
+				  xStatus = xQueueSendToBack( UartQueue, &globalState, 0 );
+			    //Manual mode ,if Pressed 
+			    while((Get_Bit(GPIO_PORTF_DATA_R,0)) == 0 && ((Get_Bit(GPIO_PORTD_DATA_R,6))==0) )//while button is pressed and limit switch is not pressed
+			    {
+				   DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+				   DIO_writePin(INT_GPIOA,PIN3,LOGIC_HIGH);
+				   DIO_writePin(INT_GPIOA,PIN4,LOGIC_LOW); 
+						   DIO_writePin(INT_GPIOB,PIN6,LOGIC_HIGH);
+				       DIO_writePin(INT_GPIOB,PIN7,LOGIC_LOW);
+			    }
+			 }
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);
+			 
+			 taskYIELD();
+	}
+}
+void DriverDown(void* pvParameters)
+	{
+		 portBASE_TYPE xStatus;
+	   xSemaphoreTake(DriverDownSemphore,0);
+     for(;;)
+     {
+     	 xSemaphoreTake(DriverDownSemphore,portMAX_DELAY);
+		 	 Down_flag = 1;
+			 Up_flag = 0;
+			 
+//--------------------------------------automatic mode------------------------------------------- 
+			 vTaskDelay(250);
+			 if((Get_Bit(GPIO_PORTF_DATA_R,4)))
+			 {
+				globalState = 'C';
+			  xStatus = xQueueSendToBack( UartQueue, &globalState, 0 );
+				Down_flag = 1;
+				Up_flag = 0;
+				DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+				DIO_writePin(INT_GPIOA,PIN3,LOGIC_LOW);
+				DIO_writePin(INT_GPIOA,PIN4,LOGIC_HIGH);
+				    DIO_writePin(INT_GPIOB,PIN7,LOGIC_HIGH);
+				    DIO_writePin(INT_GPIOB,PIN6,LOGIC_LOW);
+				while((Get_Bit(GPIO_PORTD_DATA_R,7))==0 && Up_flag == 0 );
+				Down_flag = 0;
+				DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);			 
+			 }
+			 else 
+			 {
+				  globalState = 'D';
+				  xStatus = xQueueSendToBack( UartQueue, &globalState, 0 );
+			    //Manual mode 
+			    while((Get_Bit(GPIO_PORTF_DATA_R,4) == 0)&&((Get_Bit(GPIO_PORTD_DATA_R,7))==0))
+			    {
+			    DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+			    DIO_writePin(INT_GPIOA,PIN3,LOGIC_LOW);
+			    DIO_writePin(INT_GPIOA,PIN4,LOGIC_HIGH);
+						   DIO_writePin(INT_GPIOB,PIN7,LOGIC_HIGH);
+				       DIO_writePin(INT_GPIOB,PIN6,LOGIC_LOW);
+			    }
+			    
+			 }
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);
+				taskYIELD();
+		
+	}
+}
+
+void PassengerUp(void* pvParameters)
+{
+	 xSemaphoreTake(PassengerUpSemphore,0);
+     for(;;)
+     {
+     	  xSemaphoreTake(PassengerUpSemphore,portMAX_DELAY);
+			Up_flag_Pas =1; //flag that idicate that the motor is currently working Up by pass
+			Down_flag_Pas =0;
+			 //automatic mode 
+			 vTaskDelay(250);
+			 if (Get_Bit(GPIO_PORTD_DATA_R,2)==0)
+		{
+			 if((Get_Bit(GPIO_PORTF_DATA_R,2))==1)
+			 {
+			  DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+			  DIO_writePin(INT_GPIOA,PIN3,LOGIC_HIGH);
+			  DIO_writePin(INT_GPIOA,PIN4,LOGIC_LOW);
+				     DIO_writePin(INT_GPIOB,PIN6,LOGIC_HIGH);
+				     DIO_writePin(INT_GPIOB,PIN7,LOGIC_LOW);
+				     
+				while((Get_Bit(GPIO_PORTD_DATA_R,6))==0  && Jam_Flag==0 && Down_flag_Pas == 0 );
+				 Jam_Flag = 0;
+				 Up_flag_Pas =0;
+				 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);			 
+			 }
+			 else
+			 {
+			 //Manual mode 
+			     while((Get_Bit(GPIO_PORTF_DATA_R,2))==0	 && (!(Get_Bit(GPIO_PORTD_DATA_R,6))))
+			     {
+			        DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+			        DIO_writePin(INT_GPIOA,PIN3,LOGIC_HIGH);
+			        DIO_writePin(INT_GPIOA,PIN4,LOGIC_LOW);
+						        DIO_writePin(INT_GPIOB,PIN6,LOGIC_HIGH);
+				            DIO_writePin(INT_GPIOB,PIN7,LOGIC_LOW);
+			     }
+			 }
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);
+				taskYIELD();
+		 }
+		
+	}
+}
+//t7t limit switch 2ary
+void PassengerDown(void* pvParameters)
+{
+	xSemaphoreTake(PassengerDownSemphore,0);
+     for(;;)
+     {
+     	  xSemaphoreTake(PassengerDownSemphore,portMAX_DELAY);
+			  Down_flag_Pas =1;
+			  Up_flag_Pas =0;
+			 //automatic mode 
+			 vTaskDelay(250);
+			 if (Get_Bit(GPIO_PORTD_DATA_R,2)==0)
+		{
+			 if((Get_Bit(GPIO_PORTF_DATA_R,3))==1)
+			 {
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+			 DIO_writePin(INT_GPIOA,PIN3,LOGIC_LOW);
+			 DIO_writePin(INT_GPIOA,PIN4,LOGIC_HIGH);
+				     DIO_writePin(INT_GPIOB,PIN7,LOGIC_HIGH);
+				     DIO_writePin(INT_GPIOB,PIN6,LOGIC_LOW);
+			 while((Get_Bit(GPIO_PORTD_DATA_R,7))==0  && Up_flag_Pas == 0);
+				Down_flag_Pas =0;
+				DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);			 
+			 }
+			 //Manual mode 
+			 else
+			 {
+					while((Get_Bit(GPIO_PORTF_DATA_R,3))==0 && (!(Get_Bit(GPIO_PORTD_DATA_R,7))))
+					{
+					  DIO_writePin(INT_GPIOA,PIN2,LOGIC_HIGH);
+					  DIO_writePin(INT_GPIOA,PIN3,LOGIC_LOW);
+					  DIO_writePin(INT_GPIOA,PIN4,LOGIC_HIGH);
+						     DIO_writePin(INT_GPIOB,PIN7,LOGIC_HIGH);
+				         DIO_writePin(INT_GPIOB,PIN6,LOGIC_LOW);
+					}
+					Down_flag_Pas =0;
+			 }
+			 DIO_writePin(INT_GPIOA,PIN2,LOGIC_LOW);
+				taskYIELD();
+		 }
+		
+	}
+}
+
+void UART_TASK(void *pvParameters)
+{
+	
+
+char lReceivedState;
+portBASE_TYPE xStatus;
+const portTickType xTicksToWait = 100 / portTICK_RATE_MS;
+
+	
+	for( ;; )
+	{
+		xStatus = xQueueReceive( UartQueue, &lReceivedState, xTicksToWait );
+		if( xStatus == pdPASS )
+		{
+			//convert intger to ASCII
+			 printString ("State: " , printChar);
+			switch (lReceivedState)
+			{
+				case 'A':
+					printString ( "Driver Up Auto\r\n", printChar);
+				break;
+				
+				case 'B':
+					printString ( "Driver Up Manual\r\n", printChar);
+				break;
+				
+				case 'C':
+					printString ( "Driver Down Auto\r\n", printChar);
+				break;
+				
+				case 'D':
+					printString ( "Driver Down Manual\r\n", printChar);
+				break;
+			
+		
+			}
+		}
+		
+		taskYIELD();
+	}	
+}
+
+
+
+
+
+
